@@ -15,4 +15,10 @@ git fetch --prune origin "$BRANCH"
 git checkout --detach "origin/$BRANCH"
 docker compose build --pull
 
+if grep -q '^PACHCA_WEBHOOK_SECRET=.' .env; then
+  docker compose up -d pachca-sipuni-bot
+else
+  echo 'Pachca bot was not started: set PACHCA_WEBHOOK_SECRET in .env first.'
+fi
+
 echo "Sipuni MCP image successfully built from $(git rev-parse --short HEAD)"

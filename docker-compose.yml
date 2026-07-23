@@ -8,5 +8,26 @@ services:
       - .env
     restart: unless-stopped
 
+  pachca-sipuni-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sipuni-mcp:local
+    command: ["node", "dist/pachca-bot.js"]
+    env_file:
+      - .env
+    environment:
+      PORT: 3000
+      TIME_ZONE: Europe/Moscow
+    ports:
+      - "127.0.0.1:3001:3000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
 # Deployment builds this image but deliberately does not start it: the current
 # MCP server uses stdio and requires an attached MCP client/transport.
