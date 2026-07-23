@@ -13,6 +13,6 @@ test -f .env || { echo "Missing $APP_DIR/.env" >&2; exit 1; }
 
 git fetch --prune origin "$BRANCH"
 git checkout --detach "origin/$BRANCH"
-docker compose --profile stdio build --pull
+docker compose build --pull
 
 echo "Sipuni MCP image successfully built from $(git rev-parse --short HEAD)"

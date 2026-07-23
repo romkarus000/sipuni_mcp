@@ -7,9 +7,6 @@ services:
     env_file:
       - .env
     restart: unless-stopped
-    profiles:
-      - stdio
 
-# MCP currently uses the stdio transport only. The profile prevents an idle
-# container from being started without an attached MCP client. Enable it only
-# when a compatible authenticated transport/consumer has been configured.
+# Deployment builds this image but deliberately does not start it: the current
+# MCP server uses stdio and requires an attached MCP client/transport.
