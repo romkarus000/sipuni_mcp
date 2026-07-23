@@ -186,7 +186,17 @@ function validSignature(rawBody: Buffer, signature?: string): boolean {
 }
 
 function eventSeen(event: PachcaEvent): boolean {
-  const key = `${event.type}:${event.event}:${event.id || event.message_id || ''}`;
+  // Button events refer to the same source message on every click. Include the
+  // webhook timestamp and payload so retries are deduplicated but later clicks
+  // on the same button remain valid requests.
+  const key = [
+    event.type,
+    event.event,
+    event.id || event.message_id || '',
+    event.user_id || '',
+    event.data || '',
+    event.webhook_timestamp || '',
+  ].join(':');
   const now = Date.now();
   for (const [item, expiresAt] of processedEvents) if (expiresAt <= now) processedEvents.delete(item);
   if (processedEvents.has(key)) return true;
