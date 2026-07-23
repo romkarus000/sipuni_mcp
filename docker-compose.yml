@@ -1,0 +1,15 @@
+services:
+  sipuni-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sipuni-mcp:local
+    env_file:
+      - .env
+    restart: unless-stopped
+    profiles:
+      - stdio
+
+# MCP currently uses the stdio transport only. The profile prevents an idle
+# container from being started without an attached MCP client. Enable it only
+# when a compatible authenticated transport/consumer has been configured.
