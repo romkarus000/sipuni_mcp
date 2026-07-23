@@ -13,7 +13,8 @@ test -f .env || { echo "Missing $APP_DIR/.env" >&2; exit 1; }
 
 git fetch --prune origin "$BRANCH"
 git checkout --detach "origin/$BRANCH"
-docker compose build --pull
+# Both services use the same image; build it once.
+docker compose build --pull sipuni-mcp
 
 if grep -q '^PACHCA_WEBHOOK_SECRET=.' .env; then
   docker compose up -d pachca-sipuni-bot
