@@ -4,6 +4,14 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
+import {
+  createCallCache,
+  filterByExtensions,
+  filterInternal,
+  makeTextReport,
+  metrics,
+  PeriodKind,
+} from './analytics.js';
 import { SipuniClient } from './sipuni.js';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -15,12 +23,14 @@ dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
 const SIPUNI_USER = process.env.SIPUNI_USER || '';
 const SIPUNI_SECRET = process.env.SIPUNI_SECRET || '';
+const TIME_ZONE = process.env.TIME_ZONE || 'Europe/Moscow';
 
 if (!SIPUNI_USER || !SIPUNI_SECRET) {
   console.error('CRITICAL WARNING: SIPUNI_USER or SIPUNI_SECRET environment variables are missing!');
 }
 
 const sipuniClient = new SipuniClient(SIPUNI_USER, SIPUNI_SECRET);
+const callCache = createCallCache();
 
 const server = new Server(
   {
@@ -70,7 +80,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'get_manager_call_statistics',
-        description: 'Выгрузить звонки менеджера по добавочному номеру Sipuni и рассчитать KPI.',
+        description:
+          'KPI менеджера по добавочному Sipuni. По умолчанию только summary (без массива calls). Для деталей: include_details=true + details_limit.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -86,8 +97,40 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'number',
               description: 'Добавочный номер менеджера (sipuni_extension) в АТС Sipuni (например, 201)',
             },
+            include_details: {
+              type: 'boolean',
+              description: 'Если true — добавить массив calls (по умолчанию false, экономия токенов)',
+            },
+            details_limit: {
+              type: 'number',
+              description: 'Максимум звонков в details (1..500, по умолчанию 50)',
+            },
           },
           required: ['from', 'to', 'manager_extension'],
+        },
+      },
+      {
+        name: 'get_call_stats_report',
+        description:
+          'Текстовая/JSON сводка звонков: today|yesterday|week|month|compare_weeks|compare_months|managers_week|managers_month. Один export Sipuni на период, без LLM.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            kind: {
+              type: 'string',
+              enum: [
+                'today',
+                'yesterday',
+                'week',
+                'month',
+                'compare_weeks',
+                'compare_months',
+                'managers_week',
+                'managers_month',
+              ],
+            },
+          },
+          required: ['kind'],
         },
       },
     ],
@@ -120,55 +163,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (name === 'get_manager_call_statistics') {
-      const { from, to, manager_extension } = args as {
+      const { from, to, manager_extension, include_details, details_limit } = args as {
         from: string;
         to: string;
         manager_extension: number;
+        include_details?: boolean;
+        details_limit?: number;
       };
 
-      const allCalls = await sipuniClient.exportStatistics(from, to);
-
-      // Фильтруем звонки по добавочному номеру менеджера
-      const managerCalls = allCalls.filter((c) => {
-        const shortSrc = parseInt(c.shortSrcNum, 10);
-        const shortDst = parseInt(c.shortDstNum, 10);
-        return shortSrc === manager_extension || shortDst === manager_extension;
-      });
-
+      const allCalls = filterInternal(await sipuniClient.exportStatistics(from, to));
+      const managerCalls = filterByExtensions(allCalls, [manager_extension]);
       const nameFromSipuni = managerCalls.find((c) => c.managerName)?.managerName;
-
-      // Рассчитываем аналитику
+      const summaryMetrics = metrics(managerCalls);
       const inbound = managerCalls.filter((c) => c.type === 'inbound');
       const outbound = managerCalls.filter((c) => c.type === 'outbound');
-      const answered = managerCalls.filter((c) => c.status === 'ANSWER');
-      const missed = managerCalls.filter((c) => c.status === 'NOANSWER' || c.status === 'CANCEL');
+      const avgTalkTime =
+        summaryMetrics.answered > 0 ? Math.round(summaryMetrics.talkSeconds / summaryMetrics.answered) : 0;
+      const limit = Math.min(Math.max(Number(details_limit ?? 50), 1), 500);
 
-      const totalTalkTime = answered.reduce((acc, c) => acc + c.dialogDuration, 0);
-      const avgTalkTime = answered.length > 0 ? Math.round(totalTalkTime / answered.length) : 0;
-
-      const statistics = {
+      const statistics: Record<string, unknown> = {
         manager: {
           extension: manager_extension,
           name: nameFromSipuni || 'Не указано в выгрузке Sipuni',
         },
-        period: { from, to },
+        period: { from, to, timezone: TIME_ZONE },
         summary: {
-          totalCalls: managerCalls.length,
+          totalCalls: summaryMetrics.total,
           inboundCount: inbound.length,
           outboundCount: outbound.length,
-          answeredCount: answered.length,
-          missedCount: missed.length,
+          answeredCount: summaryMetrics.answered,
+          missedCount: summaryMetrics.missed,
           answerRate:
-            managerCalls.length > 0
-              ? `${Math.round((answered.length / managerCalls.length) * 100)}%`
+            summaryMetrics.total > 0
+              ? `${Math.round((summaryMetrics.answered / summaryMetrics.total) * 100)}%`
               : '0%',
-          totalTalkTimeSeconds: totalTalkTime,
-          totalTalkTimeFormatted: `${Math.floor(totalTalkTime / 60)}м ${totalTalkTime % 60}с`,
+          answerRateDenominator: summaryMetrics.total,
+          totalTalkTimeSeconds: summaryMetrics.talkSeconds,
+          totalTalkTimeFormatted: `${Math.floor(summaryMetrics.talkSeconds / 60)}м ${summaryMetrics.talkSeconds % 60}с`,
           averageTalkTimeSeconds: avgTalkTime,
           averageTalkTimeFormatted: `${Math.floor(avgTalkTime / 60)}м ${avgTalkTime % 60}с`,
         },
-        calls: managerCalls,
       };
+
+      if (include_details) {
+        statistics.calls = managerCalls.slice(0, limit);
+        statistics.detailsTruncated = managerCalls.length > limit;
+      }
 
       return {
         content: [
@@ -177,6 +217,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             text: JSON.stringify(statistics, null, 2),
           },
         ],
+      };
+    }
+
+    if (name === 'get_call_stats_report') {
+      const { kind } = args as { kind: PeriodKind };
+      const text = await makeTextReport(sipuniClient, callCache, kind, TIME_ZONE);
+      return {
+        content: [{ type: 'text', text }],
       };
     }
 

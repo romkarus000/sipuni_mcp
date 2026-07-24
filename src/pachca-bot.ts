@@ -1,6 +1,14 @@
 import crypto from 'crypto';
 import { createServer, IncomingMessage, ServerResponse } from 'http';
-import { SipuniCallRecord, SipuniClient } from './sipuni.js';
+import {
+  CallCache,
+  createCallCache,
+  listCallsForGateway,
+  makeTextReport,
+  parseAnalyticsIntent,
+  PeriodKind,
+} from './analytics.js';
+import { SipuniClient } from './sipuni.js';
 
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 const PACHCA_TOKEN = requiredEnv('PACHCA_TOKEN');
@@ -10,10 +18,9 @@ const PACHCA_BOT_USER_ID = Number.parseInt(requiredEnv('PACHCA_BOT_USER_ID'), 10
 const SIPUNI_USER = requiredEnv('SIPUNI_USER');
 const SIPUNI_SECRET = requiredEnv('SIPUNI_SECRET');
 const TIME_ZONE = process.env.TIME_ZONE || 'Europe/Moscow';
+const MCP_GATEWAY_TOKEN = process.env.MCP_GATEWAY_TOKEN || '';
 const PACHCA_API = 'https://api.pachca.com/api/shared/v1';
 
-type PeriodKind = 'today' | 'yesterday' | 'week' | 'compare_weeks' | 'managers_week' | 'managers_month';
-type Metrics = { total: number; answered: number; missed: number; talkSeconds: number };
 type PachcaEvent = {
   type?: string;
   event?: string;
@@ -27,6 +34,7 @@ type PachcaEvent = {
 };
 
 const sipuni = new SipuniClient(SIPUNI_USER, SIPUNI_SECRET);
+const callCache: CallCache = createCallCache();
 const reportCache = new Map<string, { expiresAt: number; value: Promise<string> }>();
 const processedEvents = new Map<string, number>();
 
@@ -36,98 +44,7 @@ function requiredEnv(name: string): string {
   return value;
 }
 
-function dateParts(date = new Date()) {
-  const values = new Intl.DateTimeFormat('en-GB', {
-    timeZone: TIME_ZONE,
-    year: 'numeric', month: '2-digit', day: '2-digit',
-  }).formatToParts(date);
-  const read = (type: string) => Number(values.find((part) => part.type === type)?.value);
-  return { year: read('year'), month: read('month'), day: read('day') };
-}
-
-function dateFromParts({ year, month, day }: { year: number; month: number; day: number }): Date {
-  return new Date(Date.UTC(year, month - 1, day));
-}
-
-function shiftDays(date: Date, days: number): Date {
-  const shifted = new Date(date);
-  shifted.setUTCDate(shifted.getUTCDate() + days);
-  return shifted;
-}
-
-function sipuniDate(date: Date): string {
-  const day = String(date.getUTCDate()).padStart(2, '0');
-  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
-  return `${day}.${month}.${date.getUTCFullYear()}`;
-}
-
-function today(): Date { return dateFromParts(dateParts()); }
-
-function monday(date: Date): Date {
-  const day = date.getUTCDay() || 7;
-  return shiftDays(date, 1 - day);
-}
-
-function periodFor(kind: Exclude<PeriodKind, 'compare_weeks'>) {
-  const now = today();
-  if (kind === 'today') return { from: now, to: now, title: 'Статистика за сегодня' };
-  if (kind === 'yesterday') {
-    const day = shiftDays(now, -1);
-    return { from: day, to: day, title: 'Статистика за вчера' };
-  }
-  if (kind === 'week' || kind === 'managers_week') {
-    return { from: monday(now), to: now, title: kind === 'week' ? 'Статистика за текущую неделю' : 'Менеджеры: текущая неделя' };
-  }
-  return { from: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)), to: now, title: 'Менеджеры: текущий месяц' };
-}
-
-function metrics(calls: SipuniCallRecord[]): Metrics {
-  const answered = calls.filter((call) => call.status === 'ANSWER');
-  return {
-    total: calls.length,
-    answered: answered.length,
-    missed: calls.filter((call) => call.status === 'NOANSWER' || call.status === 'CANCEL').length,
-    talkSeconds: answered.reduce((total, call) => total + call.dialogDuration, 0),
-  };
-}
-
-function duration(seconds: number): string {
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes} мин`;
-  return `${Math.floor(minutes / 60)} ч ${minutes % 60} мин`;
-}
-
-function metricsText(value: Metrics): string {
-  return `Всего звонков: ${value.total}\nОтвеченные: ${value.answered}\nНедозвон: ${value.missed}\nПроговорено: ${duration(value.talkSeconds)}`;
-}
-
-function managerKey(call: SipuniCallRecord): string {
-  const extension = call.shortSrcNum || call.shortDstNum || 'unknown';
-  return `${call.managerName || 'Не определён'}|${extension}`;
-}
-
-function managerReport(calls: SipuniCallRecord[]): string {
-  const groups = new Map<string, SipuniCallRecord[]>();
-  for (const call of calls) {
-    const key = managerKey(call);
-    groups.set(key, [...(groups.get(key) || []), call]);
-  }
-  const rows = [...groups.entries()]
-    .map(([key, managerCalls]) => ({ key, value: metrics(managerCalls) }))
-    .sort((left, right) => right.value.total - left.value.total || left.key.localeCompare(right.key, 'ru'));
-
-  if (!rows.length) return 'Звонков за период нет.';
-  return rows.map(({ key, value }) => {
-    const [name, extension] = key.split('|');
-    return `* ${name}${extension === 'unknown' ? '' : ` (${extension})`} — ${value.total} / ${value.answered} / ${value.missed} / ${duration(value.talkSeconds)}`;
-  }).join('\n');
-}
-
-async function loadCalls(from: Date, to: Date): Promise<SipuniCallRecord[]> {
-  return sipuni.exportStatistics(sipuniDate(from), sipuniDate(to));
-}
-
-function cached(key: string, calculate: () => Promise<string>): Promise<string> {
+function cachedText(key: string, calculate: () => Promise<string>): Promise<string> {
   const current = reportCache.get(key);
   if (current && current.expiresAt > Date.now()) return current.value;
   const value = calculate().catch((error) => {
@@ -139,42 +56,41 @@ function cached(key: string, calculate: () => Promise<string>): Promise<string> 
 }
 
 async function makeReport(kind: PeriodKind): Promise<string> {
-  return cached(kind, async () => {
-    if (kind === 'compare_weeks') {
-      const currentStart = monday(today());
-      const previousStart = shiftDays(currentStart, -7);
-      const previousEnd = shiftDays(currentStart, -1);
-      const [currentCalls, previousCalls] = await Promise.all([
-        loadCalls(currentStart, today()),
-        loadCalls(previousStart, previousEnd),
-      ]);
-      return `Сравнение недель\n\nТекущая: ${sipuniDate(currentStart)}–${sipuniDate(today())}\n${metricsText(metrics(currentCalls))}\n\nПрошлая: ${sipuniDate(previousStart)}–${sipuniDate(previousEnd)}\n${metricsText(metrics(previousCalls))}`;
-    }
-
-    const period = periodFor(kind);
-    const calls = await loadCalls(period.from, period.to);
-    const header = `${period.title}\n${sipuniDate(period.from)}–${sipuniDate(period.to)}`;
-    if (kind === 'managers_week' || kind === 'managers_month') {
-      return `${header}\n\nВсего по всем менеджерам\n${metricsText(metrics(calls))}\n\nМенеджеры (всего / отвеченные / недозвон / проговорено)\n${managerReport(calls)}`;
-    }
-    return `${header}\n\n${metricsText(metrics(calls))}`;
-  });
+  return cachedText(kind, () => makeTextReport(sipuni, callCache, kind, TIME_ZONE));
 }
 
 const buttons = [
-  [{ text: 'Статистика за сегодня', data: 'sipuni:today' }, { text: 'Статистика за вчера', data: 'sipuni:yesterday' }],
-  [{ text: 'Статистика за неделю', data: 'sipuni:week' }, { text: 'Сравнение недель', data: 'sipuni:compare_weeks' }],
-  [{ text: 'Менеджеры: неделя', data: 'sipuni:managers_week' }, { text: 'Менеджеры: месяц', data: 'sipuni:managers_month' }],
+  [
+    { text: 'Статистика за сегодня', data: 'sipuni:today' },
+    { text: 'Статистика за вчера', data: 'sipuni:yesterday' },
+  ],
+  [
+    { text: 'Статистика за неделю', data: 'sipuni:week' },
+    { text: 'Сравнение недель', data: 'sipuni:compare_weeks' },
+  ],
+  [
+    { text: 'Менеджеры: неделя', data: 'sipuni:managers_week' },
+    { text: 'Менеджеры: месяц', data: 'sipuni:managers_month' },
+  ],
+  [
+    { text: 'Статистика за месяц', data: 'sipuni:month' },
+    { text: 'Сравнение месяцев', data: 'sipuni:compare_months' },
+  ],
 ];
 
 async function sendMessage(content: string, parentMessageId?: number, withButtons = false): Promise<void> {
   const response = await fetch(`${PACHCA_API}/messages`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${PACHCA_TOKEN}`, 'Content-Type': 'application/json; charset=utf-8' },
-    body: JSON.stringify({ message: {
-      entity_type: 'discussion', entity_id: PACHCA_CHAT_ID, content, parent_message_id: parentMessageId,
-      ...(withButtons ? { buttons } : {}),
-    } }),
+    body: JSON.stringify({
+      message: {
+        entity_type: 'discussion',
+        entity_id: PACHCA_CHAT_ID,
+        content,
+        parent_message_id: parentMessageId,
+        ...(withButtons ? { buttons } : {}),
+      },
+    }),
   });
   if (!response.ok) throw new Error(`Pachca API returned ${response.status}`);
 }
@@ -186,9 +102,6 @@ function validSignature(rawBody: Buffer, signature?: string): boolean {
 }
 
 function eventSeen(event: PachcaEvent): boolean {
-  // Button events refer to the same source message on every click. Include the
-  // webhook timestamp and payload so retries are deduplicated but later clicks
-  // on the same button remain valid requests.
   const key = [
     event.type,
     event.event,
@@ -208,6 +121,17 @@ function recognizedCommand(content?: string): boolean {
   return /^(\/start|\/sipuni|статистика|звонки)$/i.test((content || '').trim());
 }
 
+const PERIOD_KINDS: PeriodKind[] = [
+  'today',
+  'yesterday',
+  'week',
+  'month',
+  'compare_weeks',
+  'compare_months',
+  'managers_week',
+  'managers_month',
+];
+
 async function processEvent(event: PachcaEvent): Promise<void> {
   if (event.chat_id !== PACHCA_CHAT_ID || event.user_id === PACHCA_BOT_USER_ID || eventSeen(event)) return;
   const parentMessageId = event.message_id || event.id;
@@ -215,8 +139,8 @@ async function processEvent(event: PachcaEvent): Promise<void> {
     await sendMessage('Выберите отчёт:', parentMessageId, true);
     return;
   }
-  const kind = event.data?.startsWith('sipuni:') ? event.data.slice('sipuni:'.length) as PeriodKind : undefined;
-  if (event.type === 'button' && kind && ['today', 'yesterday', 'week', 'compare_weeks', 'managers_week', 'managers_month'].includes(kind)) {
+  const kind = event.data?.startsWith('sipuni:') ? (event.data.slice('sipuni:'.length) as PeriodKind) : undefined;
+  if (event.type === 'button' && kind && PERIOD_KINDS.includes(kind)) {
     await sendMessage(await makeReport(kind), parentMessageId);
   }
 }
@@ -230,23 +154,146 @@ function readBody(request: IncomingMessage): Promise<Buffer> {
   });
 }
 
-function reply(response: ServerResponse, status: number, body = ''): void {
+function replyText(response: ServerResponse, status: number, body = ''): void {
   response.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8' });
   response.end(body);
 }
 
+function replyJson(response: ServerResponse, status: number, body: unknown): void {
+  response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  response.end(JSON.stringify(body));
+}
+
+function authorizeGateway(request: IncomingMessage): boolean {
+  if (!MCP_GATEWAY_TOKEN) return true;
+  const header = request.headers.authorization || '';
+  const match = /^Bearer\s+(.+)$/i.exec(header);
+  return Boolean(match && match[1] === MCP_GATEWAY_TOKEN);
+}
+
+async function handleGateway(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  if (!authorizeGateway(request)) {
+    replyJson(response, 401, { error: 'Unauthorized' });
+    return;
+  }
+
+  const rawBody = await readBody(request);
+  const payload = rawBody.length ? JSON.parse(rawBody.toString('utf8')) : {};
+  const operation = String(payload.operation || '');
+  const requestId = payload.requestId || null;
+
+  if (operation === 'sipuni.stats.report') {
+    const kind = String(payload.kind || payload.query?.kind || '') as PeriodKind;
+    if (!PERIOD_KINDS.includes(kind)) {
+      replyJson(response, 400, { error: 'kind must be a supported PeriodKind', requestId });
+      return;
+    }
+    const text = await makeReport(kind);
+    replyJson(response, 200, {
+      requestId,
+      operation,
+      kind,
+      text,
+      source: 'sipuni',
+      timezone: TIME_ZONE,
+    });
+    return;
+  }
+
+  if (operation === 'sipuni.calls.list') {
+    const query = payload.query || {};
+    const dateFrom = String(query.dateFrom || '');
+    const dateTo = String(query.dateTo || '');
+    const result = await listCallsForGateway(sipuni, callCache, {
+      dateFrom,
+      dateTo,
+      managerExtensions: Array.isArray(query.managerIds)
+        ? query.managerIds.map(Number).filter((n: number) => Number.isFinite(n))
+        : Array.isArray(query.managerExtensions)
+          ? query.managerExtensions.map(Number).filter((n: number) => Number.isFinite(n))
+          : [],
+      includeDetails: query.includeDetails === true || query.includeDetails === undefined,
+      detailsLimit: Number(query.detailsLimit ?? query.crmBatchSize ?? 500),
+      timezone: query.timezone || TIME_ZONE,
+    });
+
+    // Contract expected by n8n draft: echo requestId/query + calls[]
+    replyJson(response, 200, {
+      requestId,
+      operation,
+      query: {
+        ...query,
+        dateFrom: result.period.from,
+        dateTo: result.period.to,
+      },
+      summary: result.summary,
+      period: result.period,
+      phones: result.phones,
+      calls: result.calls,
+      context: {
+        requestId,
+        query: {
+          ...query,
+          dateFrom: result.period.from,
+          dateTo: result.period.to,
+        },
+        calls: result.calls,
+      },
+    });
+    return;
+  }
+
+  if (operation === 'sipuni.intent.parse') {
+    const intent = parseAnalyticsIntent(String(payload.text || ''));
+    replyJson(response, 200, { requestId, operation, intent });
+    return;
+  }
+
+  replyJson(response, 400, {
+    error: 'Unknown operation',
+    supported: ['sipuni.calls.list', 'sipuni.stats.report', 'sipuni.intent.parse'],
+    requestId,
+  });
+}
+
 createServer(async (request, response) => {
-  if (request.method === 'GET' && request.url === '/health') return reply(response, 200, 'ok');
-  if (request.method !== 'POST' || request.url !== '/webhook') return reply(response, 404, 'Not found');
+  const url = request.url?.split('?')[0] || '';
+
+  if (request.method === 'GET' && url === '/health') {
+    replyText(response, 200, 'ok');
+    return;
+  }
+
+  if (request.method === 'POST' && url === '/v1/gateway') {
+    try {
+      await handleGateway(request, response);
+    } catch (error: any) {
+      console.error('Gateway failed:', error.message);
+      replyJson(response, 500, { error: error.message || 'Gateway error' });
+    }
+    return;
+  }
+
+  if (request.method !== 'POST' || url !== '/webhook') {
+    replyText(response, 404, 'Not found');
+    return;
+  }
+
   try {
     const rawBody = await readBody(request);
-    if (!validSignature(rawBody, request.headers['pachca-signature'] as string | undefined)) return reply(response, 401, 'Invalid signature');
+    if (!validSignature(rawBody, request.headers['pachca-signature'] as string | undefined)) {
+      replyText(response, 401, 'Invalid signature');
+      return;
+    }
     const event = JSON.parse(rawBody.toString('utf8')) as PachcaEvent;
-    if (!event.webhook_timestamp || Math.abs(Date.now() / 1000 - event.webhook_timestamp) > 60) return reply(response, 401, 'Expired event');
-    reply(response, 200, 'OK');
+    if (!event.webhook_timestamp || Math.abs(Date.now() / 1000 - event.webhook_timestamp) > 60) {
+      replyText(response, 401, 'Expired event');
+      return;
+    }
+    replyText(response, 200, 'OK');
     void processEvent(event).catch((error) => console.error('Pachca event processing failed:', error.message));
   } catch (error: any) {
     console.error('Pachca webhook failed:', error.message);
-    reply(response, 400, 'Bad request');
+    replyText(response, 400, 'Bad request');
   }
-}).listen(PORT, '0.0.0.0', () => console.error(`Pachca Sipuni bot listening on ${PORT}`));
+}).listen(PORT, '0.0.0.0', () => console.error(`Pachca Sipuni bot + gateway listening on ${PORT}`));

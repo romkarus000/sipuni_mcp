@@ -7,6 +7,7 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+    profiles: ["stdio-mcp"]
 
   pachca-sipuni-bot:
     build:
@@ -21,6 +22,9 @@ services:
       TIME_ZONE: Europe/Moscow
     ports:
       - "127.0.0.1:3001:3000"
+    networks:
+      - default
+      - n8n
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
@@ -29,5 +33,10 @@ services:
       retries: 3
       start_period: 10s
 
-# Deployment builds this image but deliberately does not start it: the current
-# MCP server uses stdio and requires an attached MCP client/transport.
+networks:
+  n8n:
+    name: n8n_default
+    external: true
+
+# MCP stdio image is built by deploy.sh but not started as HTTP.
+# n8n reaches the gateway at http://pachca-sipuni-bot:3000/v1/gateway (shared n8n_default network).
