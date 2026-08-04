@@ -4,9 +4,13 @@ import {
   CallCache,
   createCallCache,
   listCallsForGateway,
+  makePhonesTextReport,
   makeTextReport,
   parseAnalyticsIntent,
   PeriodKind,
+  today,
+  shiftDays,
+  isoDay,
 } from './analytics.js';
 import { SipuniClient } from './sipuni.js';
 
@@ -243,6 +247,29 @@ async function handleGateway(request: IncomingMessage, response: ServerResponse)
     return;
   }
 
+  if (operation === 'sipuni.phones.report') {
+    const phones = Array.isArray(payload.phones)
+      ? payload.phones.map(String)
+      : Array.isArray(payload.query?.phones)
+        ? payload.query.phones.map(String)
+        : [];
+    const now = today(TIME_ZONE);
+    const defaultFrom = isoDay(shiftDays(now, -29));
+    const defaultTo = isoDay(now);
+    const dateFrom = String(payload.dateFrom || payload.query?.dateFrom || defaultFrom);
+    const dateTo = String(payload.dateTo || payload.query?.dateTo || defaultTo);
+    const text = await makePhonesTextReport(sipuni, callCache, phones, dateFrom, dateTo, TIME_ZONE);
+    replyJson(response, 200, {
+      requestId,
+      operation,
+      text,
+      phones,
+      period: { from: dateFrom, to: dateTo, timezone: TIME_ZONE },
+      source: 'sipuni',
+    });
+    return;
+  }
+
   if (operation === 'sipuni.intent.parse') {
     const intent = parseAnalyticsIntent(String(payload.text || ''));
     replyJson(response, 200, { requestId, operation, intent });
@@ -251,7 +278,7 @@ async function handleGateway(request: IncomingMessage, response: ServerResponse)
 
   replyJson(response, 400, {
     error: 'Unknown operation',
-    supported: ['sipuni.calls.list', 'sipuni.stats.report', 'sipuni.intent.parse'],
+    supported: ['sipuni.calls.list', 'sipuni.stats.report', 'sipuni.phones.report', 'sipuni.intent.parse'],
     requestId,
   });
 }

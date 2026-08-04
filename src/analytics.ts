@@ -21,6 +21,8 @@ export type AnalyticsQuery = {
   dateFrom: string; // YYYY-MM-DD
   dateTo: string; // YYYY-MM-DD
   managerExtensions?: number[];
+  /** Normalized client phones (7XXXXXXXXXX); if set, only these numbers are kept */
+  phones?: string[];
   includeDetails?: boolean;
   detailsLimit?: number;
   timezone?: string;
@@ -226,6 +228,21 @@ export function filterInternal(calls: SipuniCallRecord[], includeInternal = fals
   return calls.filter((call) => call.type !== 'internal');
 }
 
+export function filterByPhones(calls: SipuniCallRecord[], phones?: string[]): SipuniCallRecord[] {
+  if (!phones?.length) return calls;
+  const want = new Set(phones.map(normalizePhone).filter((p) => p.length === 11 && p.startsWith('7')));
+  if (!want.size) return calls;
+  return calls.filter((call) => want.has(clientPhone(call)));
+}
+
+export function extractPhonesFromText(text: string): string[] {
+  const matches = String(text || '').match(/(?:\+?7|8)\s*[\d\-()\s]{9,18}/g) || [];
+  const phones = matches
+    .map(normalizePhone)
+    .filter((phone) => phone.length === 11 && phone.startsWith('7'));
+  return [...new Set(phones)];
+}
+
 export function filterByExtensions(calls: SipuniCallRecord[], extensions?: number[]): SipuniCallRecord[] {
   if (!extensions?.length) return calls;
   const set = new Set(extensions);
@@ -337,6 +354,7 @@ export async function listCallsForGateway(
 
   let calls = filterInternal(await loadCallsCached(client, cache, from, to));
   calls = filterByExtensions(calls, query.managerExtensions);
+  calls = filterByPhones(calls, query.phones);
 
   const normalized = calls.map((call) => toNormalizedCall(call, timeZone));
   const phones = [...new Set(normalized.map((call) => call.phone).filter(Boolean))];
@@ -356,18 +374,116 @@ export async function listCallsForGateway(
   };
 }
 
+function hhmm(sec: number): string {
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (h > 0) return `${h} ч ${m} мин`;
+  return `${m} мин`;
+}
+
+/** Compact call stats for one or more client phones over a period. */
+export async function makePhonesTextReport(
+  client: SipuniClient,
+  cache: CallCache,
+  phonesInput: string[],
+  dateFrom: string,
+  dateTo: string,
+  timeZone = DEFAULT_TZ
+): Promise<string> {
+  const phones = [...new Set(phonesInput.map(normalizePhone).filter((p) => p.length === 11 && p.startsWith('7')))];
+  if (!phones.length) {
+    return 'Не удалось распознать номера телефонов. Пример: /analytics +79001234567 +79007654321';
+  }
+
+  const result = await listCallsForGateway(client, cache, {
+    dateFrom,
+    dateTo,
+    phones,
+    includeDetails: true,
+    detailsLimit: 2000,
+    timezone: timeZone,
+  });
+
+  const byPhone = new Map<string, NormalizedCall[]>();
+  for (const phone of phones) byPhone.set(phone, []);
+  for (const call of result.calls) {
+    const list = byPhone.get(call.phone);
+    if (list) list.push(call);
+  }
+
+  const blocks: string[] = [
+    `Звонки по номерам`,
+    `Период: ${dateFrom}–${dateTo} (${timeZone})`,
+    '',
+  ];
+
+  for (const phone of phones) {
+    const calls = (byPhone.get(phone) || []).sort(
+      (a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()
+    );
+    const answered = calls.filter((c) => c.answered).length;
+    const missed = calls.length - answered;
+    const talk = calls.reduce((s, c) => s + Number(c.dialogDurationSeconds || 0), 0);
+    const last = calls[0];
+    blocks.push(`📞 +${phone}`);
+    blocks.push(`• всего ${calls.length} · отвеченные ${answered} · недозвон ${missed} · проговорено ${hhmm(talk)}`);
+    if (last) {
+      const when = new Intl.DateTimeFormat('ru-RU', {
+        timeZone,
+        day: '2-digit',
+        month: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      }).format(new Date(last.startedAt));
+      blocks.push(
+        `• последний: ${when} · ${last.answered ? 'дозвон' : 'недозвон'} · ${last.managerName}${last.managerExtension ? ` (${last.managerExtension})` : ''}`
+      );
+    } else {
+      blocks.push('• за период звонков не найдено');
+    }
+    const examples = calls.slice(0, 5).map((c) => {
+      const when = new Intl.DateTimeFormat('ru-RU', {
+        timeZone,
+        day: '2-digit',
+        month: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      }).format(new Date(c.startedAt));
+      return `  · ${when} · ${c.answered ? 'OK' : 'НДЗ'} · ${c.managerName || '—'} · ${hhmm(c.dialogDurationSeconds)}`;
+    });
+    if (examples.length) {
+      blocks.push('• последние:');
+      blocks.push(...examples);
+    }
+    blocks.push('');
+  }
+
+  return blocks.join('\n').trim();
+}
+
 export function parseAnalyticsIntent(text: string): {
   kind?: PeriodKind;
   help?: string;
   dateFrom?: string;
   dateTo?: string;
   managerExtension?: number;
+  phones?: string[];
 } {
-  const raw = text.trim().toLowerCase();
+  const stripped = String(text || '')
+    .trim()
+    .replace(/^\/anal[yi]?t[yi]?c?s?\b\s*/i, '')
+    .trim();
+  const phones = extractPhonesFromText(stripped || text);
+  if (phones.length) return { phones };
+
+  const raw = stripped.toLowerCase();
   if (!raw) {
     return {
       help:
-        'Примеры:\n/analytics неделя\n/analytics месяц\n/analytics сравни недели\n/analytics сравни месяцы\n/analytics менеджеры неделя\n/analytics менеджеры месяц\n/analytics сегодня',
+        'Примеры:\n/analytics неделя\n/analytics месяц\n/analytics сравни недели\n/analytics сравни месяцы\n/analytics менеджеры неделя\n/analytics менеджеры месяц\n/analytics сегодня\n/analytics +79001234567 +79007654321',
     };
   }
   if (/сравн.*месяц/.test(raw)) return { kind: 'compare_months' };
@@ -380,6 +496,6 @@ export function parseAnalyticsIntent(text: string): {
   if (/недел/.test(raw)) return { kind: 'week' };
   return {
     help:
-      'Не распознал запрос. Примеры:\n/analytics неделя\n/analytics месяц\n/analytics сравни недели\n/analytics менеджеры месяц',
+      'Не распознал запрос. Примеры:\n/analytics неделя\n/analytics месяц\n/analytics сравни недели\n/analytics менеджеры месяц\n/analytics +79001234567',
   };
 }
