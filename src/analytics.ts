@@ -378,8 +378,10 @@ function hhmm(sec: number): string {
   const s = Math.max(0, Math.floor(Number(sec) || 0));
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
+  const rem = s % 60;
   if (h > 0) return `${h} ч ${m} мин`;
-  return `${m} мин`;
+  if (m > 0) return rem ? `${m} мин ${rem} с` : `${m} мин`;
+  return `${rem} с`;
 }
 
 /** Compact call stats for one or more client phones over a period. */
