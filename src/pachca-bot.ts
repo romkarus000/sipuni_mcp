@@ -125,6 +125,18 @@ function recognizedCommand(content?: string): boolean {
   return /^(\/start|\/sipuni|статистика|звонки)$/i.test((content || '').trim());
 }
 
+function looksLikeAnalyticsMessage(content?: string): boolean {
+  const text = String(content || '').trim();
+  if (!text) return false;
+  if (/^\/anal[yi]?t[yi]?c?s?\b/i.test(text)) return true;
+  if (/(?:\+?7|8)\s*[\d\-()\s]{9,}/.test(text)) return true;
+  return /(звонк|стат|менеджер|оплат|лид|недел|месяц|вчера|сегодня|сравн|аналит)/i.test(text);
+}
+
+function wantsCrm(text: string): boolean {
+  return /оплат|продаж|лид|crm|выручк|деньг|скле|статус.*клиент|после\s+звонк/i.test(text);
+}
+
 const PERIOD_KINDS: PeriodKind[] = [
   'today',
   'yesterday',
@@ -136,17 +148,97 @@ const PERIOD_KINDS: PeriodKind[] = [
   'managers_month',
 ];
 
+const N8N_CRM_WEBHOOK = process.env.N8N_CRM_WEBHOOK_URL || 'https://flow.ai.edpro.io/webhook/manager-sales-analytics';
+
+async function makeCrmReport(kind: 'today' | 'yesterday' | 'week'): Promise<string> {
+  const now = today(TIME_ZONE);
+  let dateFrom = isoDay(now);
+  let dateTo = isoDay(now);
+  if (kind === 'yesterday') {
+    const y = shiftDays(now, -1);
+    dateFrom = isoDay(y);
+    dateTo = isoDay(y);
+  } else if (kind === 'week') {
+    // monday..today
+    const day = now.getUTCDay() || 7;
+    dateFrom = isoDay(shiftDays(now, 1 - day));
+  }
+  const response = await fetch(N8N_CRM_WEBHOOK, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      requestId: `pachca-${Date.now()}`,
+      dateFrom,
+      dateTo,
+      channels: ['calls'],
+      attributionWindowDays: 14,
+      crmBatchSize: 300,
+      managerIds: [],
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`CRM engine HTTP ${response.status}`);
+  }
+  const body = (await response.json()) as { text?: string };
+  if (!body.text) throw new Error('CRM engine returned empty text');
+  return body.text;
+}
+
 async function processEvent(event: PachcaEvent): Promise<void> {
   if (event.chat_id !== PACHCA_CHAT_ID || event.user_id === PACHCA_BOT_USER_ID || eventSeen(event)) return;
   const parentMessageId = event.message_id || event.id;
-  if (event.type === 'message' && event.event === 'new' && recognizedCommand(event.content)) {
+
+  if (event.type === 'button') {
+    const kind = event.data?.startsWith('sipuni:') ? (event.data.slice('sipuni:'.length) as PeriodKind) : undefined;
+    if (kind && PERIOD_KINDS.includes(kind)) {
+      await sendMessage(await makeReport(kind), parentMessageId);
+    }
+    return;
+  }
+
+  if (!(event.type === 'message' && event.event === 'new')) return;
+  const content = String(event.content || '').trim();
+  if (!content) return;
+
+  if (recognizedCommand(content)) {
     await sendMessage('Выберите отчёт:', parentMessageId, true);
     return;
   }
-  const kind = event.data?.startsWith('sipuni:') ? (event.data.slice('sipuni:'.length) as PeriodKind) : undefined;
-  if (event.type === 'button' && kind && PERIOD_KINDS.includes(kind)) {
-    await sendMessage(await makeReport(kind), parentMessageId);
+
+  if (!looksLikeAnalyticsMessage(content)) return;
+
+  const intent = parseAnalyticsIntent(content);
+  if (intent.phones?.length) {
+    const now = today(TIME_ZONE);
+    const dateFrom = isoDay(shiftDays(now, -29));
+    const dateTo = isoDay(now);
+    const text = await makePhonesTextReport(sipuni, callCache, intent.phones, dateFrom, dateTo, TIME_ZONE);
+    await sendMessage(text, parentMessageId);
+    return;
   }
+
+  if (intent.kind && PERIOD_KINDS.includes(intent.kind)) {
+    if (wantsCrm(content) && (intent.kind === 'today' || intent.kind === 'yesterday' || intent.kind === 'week')) {
+      try {
+        await sendMessage(await makeCrmReport(intent.kind), parentMessageId);
+      } catch (error: any) {
+        console.error('CRM report failed:', error.message);
+        await sendMessage(
+          `${await makeReport(intent.kind)}\n\n⚠️ CRM/оплаты сейчас недоступны (n8n). Показала только звонки Sipuni.`,
+          parentMessageId
+        );
+      }
+      return;
+    }
+    await sendMessage(await makeReport(intent.kind), parentMessageId);
+    return;
+  }
+
+  await sendMessage(
+    intent.help ||
+      'Не распознал запрос. Примеры:\nсегодня\nменеджеры неделя\nоплаты вчера\n+79001234567 +79007654321',
+    parentMessageId
+  );
 }
 
 function readBody(request: IncomingMessage): Promise<Buffer> {
