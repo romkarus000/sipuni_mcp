@@ -121,15 +121,30 @@ function eventSeen(event: PachcaEvent): boolean {
   return false;
 }
 
+function isBotUser(userId: unknown): boolean {
+  const n = Number(userId);
+  return Number.isFinite(n) && n === PACHCA_BOT_USER_ID;
+}
+
+/** Bot replies must never be treated as user commands (feedback loop). */
+function isBotReportContent(content?: string): boolean {
+  const text = String(content || '').trim();
+  if (!text) return false;
+  return /^(статистика за|звонки по номерам|период:|выберите отчёт|не распознал запрос|⚠️)/i.test(text);
+}
+
 function recognizedCommand(content?: string): boolean {
   return /^(\/start|\/sipuni|статистика|звонки)$/i.test((content || '').trim());
 }
 
 function looksLikeAnalyticsMessage(content?: string): boolean {
   const text = String(content || '').trim();
-  if (!text) return false;
+  if (!text || isBotReportContent(text)) return false;
   if (/^\/anal[yi]?t[yi]?c?s?\b/i.test(text)) return true;
-  if (/(?:\+?7|8)\s*[\d\-()\s]{9,}/.test(text)) return true;
+  // phones only if message is short / looks like a request, not a pasted report
+  if (/(?:\+?7|8)\s*[\d\-()\s]{9,}/.test(text) && text.length < 500) return true;
+  // free-text analytics: require compact user query, not multi-line reports
+  if (text.includes('\n')) return false;
   return /(звонк|стат|менеджер|оплат|лид|недел|месяц|вчера|сегодня|сравн|аналит)/i.test(text);
 }
 
@@ -185,7 +200,7 @@ async function makeCrmReport(kind: 'today' | 'yesterday' | 'week'): Promise<stri
 }
 
 async function processEvent(event: PachcaEvent): Promise<void> {
-  if (event.chat_id !== PACHCA_CHAT_ID || event.user_id === PACHCA_BOT_USER_ID || eventSeen(event)) return;
+  if (Number(event.chat_id) !== PACHCA_CHAT_ID || isBotUser(event.user_id) || eventSeen(event)) return;
   const parentMessageId = event.message_id || event.id;
 
   if (event.type === 'button') {
@@ -198,7 +213,7 @@ async function processEvent(event: PachcaEvent): Promise<void> {
 
   if (!(event.type === 'message' && event.event === 'new')) return;
   const content = String(event.content || '').trim();
-  if (!content) return;
+  if (!content || isBotReportContent(content)) return;
 
   if (recognizedCommand(content)) {
     await sendMessage('Выберите отчёт:', parentMessageId, true);
@@ -236,7 +251,7 @@ async function processEvent(event: PachcaEvent): Promise<void> {
 
   await sendMessage(
     intent.help ||
-      'Не распознал запрос. Примеры:\nсегодня\nменеджеры неделя\nоплаты вчера\n+79001234567 +79007654321',
+      'Не распознал запрос. Примеры:\nсегодня\nменеджеры неделя\nоплаты вчера\n+79001234567',
     parentMessageId
   );
 }
