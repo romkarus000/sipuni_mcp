@@ -179,7 +179,7 @@ async function makeCrmReport(kind: 'today' | 'yesterday' | 'week'): Promise<stri
     dateFrom = isoDay(shiftDays(now, 1 - day));
   }
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20_000);
+  const timer = setTimeout(() => controller.abort(), 60_000);
   try {
     const response = await fetch(N8N_CRM_WEBHOOK, {
       method: 'POST',
