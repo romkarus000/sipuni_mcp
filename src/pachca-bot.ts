@@ -178,25 +178,32 @@ async function makeCrmReport(kind: 'today' | 'yesterday' | 'week'): Promise<stri
     const day = now.getUTCDay() || 7;
     dateFrom = isoDay(shiftDays(now, 1 - day));
   }
-  const response = await fetch(N8N_CRM_WEBHOOK, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      requestId: `pachca-${Date.now()}`,
-      dateFrom,
-      dateTo,
-      channels: ['calls'],
-      attributionWindowDays: 14,
-      crmBatchSize: 300,
-      managerIds: [],
-    }),
-  });
-  if (!response.ok) {
-    throw new Error(`CRM engine HTTP ${response.status}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20_000);
+  try {
+    const response = await fetch(N8N_CRM_WEBHOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        requestId: `pachca-${Date.now()}`,
+        dateFrom,
+        dateTo,
+        channels: ['calls'],
+        attributionWindowDays: 14,
+        crmBatchSize: 300,
+        managerIds: [],
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`CRM engine HTTP ${response.status}`);
+    }
+    const body = (await response.json()) as { text?: string };
+    if (!body.text) throw new Error('CRM engine returned empty text');
+    return body.text;
+  } finally {
+    clearTimeout(timer);
   }
-  const body = (await response.json()) as { text?: string };
-  if (!body.text) throw new Error('CRM engine returned empty text');
-  return body.text;
 }
 
 async function processEvent(event: PachcaEvent): Promise<void> {
